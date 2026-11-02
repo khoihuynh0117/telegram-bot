@@ -16,7 +16,7 @@ from ddgs import DDGS
 
 TOKEN = "9298916796:AAGUipWdrWPxW1GU_efvpp--ginHJLbd92w"
 CHAT_ID = "6500543897"
-INTERVAL = 5 * 60  # 5 phút (nghỉ giữa 2 lượt quét)
+INTERVAL = 50 
 SEEN_FILE = "seen.json"
 MAX_PER_ITEM = 10  # tối đa số tin gửi mỗi món trong 1 lần quét
 
