@@ -1,7 +1,7 @@
-"""Telegram bot: cứ mỗi 2 tiếng tìm IC STK4026 và loa Yamaha MS202II,
-chỉ gửi những kết quả MỚI (chưa gửi trước đó) về Telegram.
+"""Telegram bot: tìm IC STK4026 và loa Yamaha MS202II trên các trang bán hàng,
+chỉ gửi những kết quả MỚI (chưa gửi trước đó, không trùng) về Telegram.
 
-Nguồn tìm: tìm kiếm web (DuckDuckGo, khu vực VN) + Chợ Tốt.
+Nguồn tìm: các trang bán hàng (qua tìm kiếm web) + Chợ Tốt (API trực tiếp).
 """
 import html
 import json
@@ -9,18 +9,21 @@ import logging
 import os
 import re
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 from ddgs import DDGS
 
+# ====== ĐIỀN 2 DÒNG NÀY (giữ nguyên dấu ngoặc kép) ======
 TOKEN = "9298916796:AAGUipWdrWPxW1GU_efvpp--ginHJLbd92w"
 CHAT_ID = "6500543897"
-INTERVAL = 50 
-SEEN_FILE = "seen.json"
+# ========================================================
+
+INTERVAL = 50  # giây nghỉ giữa 2 lượt quét (50 giây dễ bị chặn, tăng lên nếu thấy lỗi 429)
+SEEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen.json")
 MAX_PER_ITEM = 10  # tối đa số tin gửi mỗi món trong 1 lần quét
 
-# Mỗi món: tên hiển thị, từ khóa tìm, và chuỗi bắt buộc phải xuất hiện trong tiêu đề/mô tả
+# Mỗi món: tên hiển thị, từ khóa tìm, và chuỗi bắt buộc phải xuất hiện trong tiêu đề/link
 ITEMS = [
     {
         "name": "IC STK4026",
@@ -58,15 +61,27 @@ FB_LINKS = {
 }
 
 # Bỏ các link không phải tin bán hàng
-BAD_URL = ["/videos/", "/reel", "/watch", "/hashtag", "/category", "/c", "/blog", "/news"]
+BAD_URL = ["/videos/", "/reel", "/watch", "/hashtag", "/category", "/blog", "/news"]
 SALE_WORDS = re.compile(r"\b(mua|bán|giá|sell|selling|price|ship|for sale|in stock)\b", re.I)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
+for noisy in ("ddgs", "primp", "httpx", "httpcore"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def norm(text: str) -> str:
     return re.sub(r"[\s\-_]", "", (text or "").lower())
+
+
+def canon(url: str) -> str:
+    """Chuẩn hóa link để cùng một tin luôn ra cùng một khóa."""
+    p = urlsplit(url)
+    host = re.sub(r"^(www|m)\.", "", p.netloc.lower())
+    key = host + p.path.rstrip("/").lower()
+    if "facebook.com" in host and p.query:  # bài FB phân biệt bằng tham số
+        key += "?" + p.query
+    return key
 
 
 def load_seen() -> set:
@@ -131,23 +146,30 @@ def search_chotot(query: str):
 
 def run_once(seen: set) -> None:
     for item in ITEMS:
-        found = {}
+        found = {}  # khóa chuẩn hóa -> (url gốc, tiêu đề, mô tả, nguồn, khóa tiêu đề)
+        titles = set()
+
         def consider(results):
             for title, url, body, src in results:
-                if not url or url in seen or url in found:
+                if not url:
+                    continue
+                key = canon(url)
+                clean_title = re.sub(r"#\w+", "", title)
+                tkey = f"t:{item['name']}:{src}:{norm(clean_title)[:80]}"
+                if key in seen or tkey in seen or key in found or tkey in titles:
                     continue
                 # Từ khóa phải nằm trong TIÊU ĐỀ hoặc LINK (không tính hashtag, không tính mô tả)
-                clean_title = re.sub(r"#\w+", "", title)
                 if not any(m in norm(clean_title + " " + url) for m in item["must"]):
                     continue
                 low = url.lower()
-                if any(b in low for b in BAD_URL if b != "/c") or re.search(r"/c\d+", low):
+                if any(b in low for b in BAD_URL) or re.search(r"/c\d+", low):
                     continue
                 # Facebook: chỉ nhận Marketplace hoặc bài có từ khóa mua bán
                 if "facebook.com" in low and "/marketplace/item" not in low:
                     if not SALE_WORDS.search(title + " " + body):
                         continue
-                found[url] = (title, body, src)
+                found[key] = (url, title, body, src, tkey)
+                titles.add(tkey)
 
         for q in item["queries"]:
             for site in SHOP_SITES:
@@ -156,22 +178,26 @@ def run_once(seen: set) -> None:
             consider(search_chotot(q))
 
         log.info("%s: %d kết quả mới", item["name"], len(found))
-        for url, (title, body, src) in list(found.items())[:MAX_PER_ITEM]:
-            msg = (
+
+        # Đánh dấu "đã thấy" TRƯỚC khi gửi, để lỡ lỗi/tắt giữa chừng cũng không gửi lại
+        for key, (_, _, _, _, tkey) in found.items():
+            seen.add(key)
+            seen.add(tkey)
+        save_seen(seen)
+
+        for key, (url, title, body, src, _) in list(found.items())[:MAX_PER_ITEM]:
+            send(
                 f"🔎 <b>{html.escape(item['name'])}</b> · {src}\n"
                 f"{html.escape(title)}\n"
                 f"{html.escape(body[:200])}\n"
                 f"{url}"
             )
-            send(msg)
             time.sleep(1)
-        seen.update(found.keys())  # đánh dấu đã thấy, kể cả phần vượt giới hạn
-        save_seen(seen)
 
 
 def main() -> None:
     seen = load_seen()
-    send("✅ Bot đã chạy. Sẽ quét STK4026 và Yamaha MS202II mỗi 5 phút.")
+    send(f"✅ Bot đã chạy. Nghỉ {INTERVAL} giây giữa các lượt quét STK4026 và Yamaha MS202II.")
     lines = ["📘 <b>Link tìm trực tiếp trên Facebook</b> (bấm để xem):"]
     for name, kw in FB_LINKS.items():
         q = quote(kw)
